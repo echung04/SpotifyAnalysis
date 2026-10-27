@@ -1,5 +1,278 @@
 ---
 title: "First Exploration of data"
-output: html_document
+author: "Evan Chung"
+date: "10/26/2026"
+output:
+  pdf_document: default
+  html_document: default
 ---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  message = FALSE,
+  warning = FALSE
+)
 
+library(jsonlite)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+
+files <- list.files(pattern = "\\.json$", full.names = TRUE)
+cat("Found", length(files), "JSON files\n")
+ 
+read_one <- function(f) {
+  df <- fromJSON(f, flatten = TRUE)
+  df$source_file <- basename(f)
+  df
+}
+
+spotify_raw <- bind_rows(lapply(files, read_one))
+ 
+cat("Total rows:", nrow(spotify_raw), "\n")
+```
+
+
+```{r}
+# I used GenAI here to learn what function can convert ts into a date-time format
+# and to convert into a correct time
+# I also used it in a couple spots throughout to help with mutations
+spotify <- spotify_raw %>%
+  mutate(
+    ts = as.POSIXct(ts, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    month = as.integer(format(ts, "%m", tz = "America/Indianapolis")),   # 1-12
+    year  = as.integer(format(ts, "%Y", tz = "America/Indianapolis")),   # e.g. 2023
+    minutes_played = ms_played / 1000 / 60
+  ) %>%
+  filter(!is.na(master_metadata_track_name)) %>%
+  distinct(ts, spotify_track_uri, ms_played, .keep_all = TRUE) %>%
+  transmute(
+    track_name  = master_metadata_track_name,
+    artist_name = master_metadata_album_artist_name,
+    album_name  = master_metadata_album_album_name,
+    reason_start,
+    reason_end,
+    month,
+    year,
+    shuffle,
+    skipped,
+    minutes_played
+  )
+ 
+```
+
+Taking the raw data from the json files provided by Spotify was messy. It has data down to the millisecond and would not be helpful for reading or viewing as a human so I translated data into minutes per track and transformed some column names for readability.
+
+```{r}
+monthly <- spotify %>%
+  mutate(date = as.Date(sprintf("%04d-%02d-01", year, month))) %>%
+  group_by(date) %>%
+  summarise(
+    hours_listened = round(sum(minutes_played) / 60, 2),
+    n_plays        = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    year  = as.integer(format(date, "%Y")),
+    month = as.integer(format(date, "%m"))
+  )
+```
+
+
+```{r}
+library(scales)
+fig1 <- monthly %>%
+  ggplot(aes(x = date, y = hours_listened)) +
+  
+  geom_line() +
+  
+  scale_x_date(
+    date_breaks = "1 year", 
+    date_labels = "%Y"
+  ) +
+
+  scale_y_continuous(labels = label_number(accuracy = 1)) +
+  
+  labs(
+    x = "Year", y = "Hours listened",
+    title = "Monthly listening volume, by year",
+    subtitle = "Spotify streaming data"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  theme_bw()
+
+fig1
+```
+I aggregated my listening into months and wanted to see a time-series plot of my minutes listened for every month I had Spotify. This graph gave good insight but looked boring and a little confusing due to the scale and constant changes in slope for each month. This led me to create my new plot.
+
+```{r}
+library(RColorBrewer)
+quarterly <- monthly %>%
+  mutate(
+    quarter_num = quarter(date),
+    quarter_label = paste0(year, " Q", quarter_num),
+    quarter_date = as.Date(paste0(year, "-", (quarter_num - 1) * 3 + 1, "-01"))
+  ) %>%
+  group_by(quarter_date, quarter_label) %>%
+  summarise(
+    hours_listened = sum(hours_listened),
+    .groups = "drop"
+  )
+
+fig1_quarterly <- ggplot(quarterly, aes(x = quarter_date, y = hours_listened)) +
+  geom_line(color = brewer.pal(3, "Blues")[2], linewidth = 1) +
+  geom_point(color = brewer.pal(3, "Blues")[3], size = 2.5) +
+  
+  scale_x_date(
+    date_breaks = "1 year", 
+    date_labels = "%Y"
+  ) +
+  scale_y_continuous(labels = label_number(accuracy = 1)) +
+  
+  labs(
+    x = "Year", y = "Total Hours Listened (per Quarter)",
+    title = "Quarterly Listening Volume",
+    subtitle = "Aggregated in 3-month blocks"
+  ) +
+  
+  theme_bw(base_size = 12) 
+
+fig1_quarterly
+```
+This plot splits the listening data into quarters for each year. This way I still maintain the trends over smaller time periods without the graph looking too messy when trying to determine trends. I introduced labels that make sense for someone looking at the graph for the first time and made the line a pleasing color to make it better to look at as well as making it clear what trends existed. The plotted points made it easier to determine exactly when some of the quarters are happening as well, adding clarity. For example, there is a large jump from Q2 of 2020 to Q3 of 2020. I got my driver's license in March 2020, but lockdown stopped me from driving for the first few months I had my license. Once restrictions were lifted we can see a large jump in listening that has maintained the past few years, where all of these quarters are higher than all pre-Q3 2020 quarters. I suspected since I drive a lot and am always listening to music while driving that my time listened would jump during this time, so it is cool to actually see in the graph. For both of these previous plots, I decided to make these line charts as I thought it would display the time-series aspect of the data in the cleanest way. 
+
+```{r}
+top_artists <- spotify %>%
+  group_by(artist_name) %>%
+  summarise(
+    total_hours = sum(minutes_played) / 60,
+    plays = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_hours)) %>%
+  slice_head(n = 10) %>%
+  mutate(artist_name = fct_reorder(artist_name, total_hours))
+
+ggplot(top_artists, aes(x = total_hours, y = artist_name)) +
+  geom_col(fill = brewer.pal(3, "Blues")[3])  +
+  scale_x_continuous(labels = label_number(accuracy = 1)) +
+  labs(
+    x = "Total Hours Listened", 
+    y = NULL,
+    title = "Top 10 Most Listened to Artists",
+    subtitle = "Based on total streaming hours"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme_bw()
+```
+Next, I wanted to explore the artists that I listened to. First I created a graph to display my 10 most listened to artists. I created this bar chart to visualize the hours each artist was listened to to find some trends. From this first initial graph, I noticed a few things. First was the presence of Koji Kondo. I had no idea who this was when initially making this graph and thought somehow I incorrectly parsed the data or there was some other data quality issue. After some exploration into my Spotify account, I found that this artist made a classical song that I would play on repeat while taking naps in high school. Second, the amount of hours I have listened to Kanye is much larger than any other artist. I know I liked Kanye in high school, but after some comments made by him publicly, I didn't listen to him as much. Given all this information, I wanted to create some visualizations that could account for these issues to give a better view into my listening habits. I created a horizontal bar chart here because I believe this would give the cleanest and least cluttered chart for this information, expecially since it has the long names of artists. 
+
+```{r}
+top_artists_by_period <- spotify %>%
+  mutate(
+    period = if_else(year > 2022, "2023 and Onward", "2022 and Before"),
+    period = factor(period, levels = c("2022 and Before", "2023 and Onward"))
+  ) %>%
+  group_by(period, artist_name) %>%
+  summarise(total_hours = sum(minutes_played) / 60, .groups = "drop") %>%
+  group_by(period) %>%
+  slice_max(total_hours, n = 10) %>%
+  ungroup() %>%
+  mutate(key = fct_reorder(paste(period, artist_name, sep = "___"), total_hours))
+
+ggplot(top_artists_by_period, aes(x = total_hours, y = key, fill = period)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ period, scales = "free_y") +
+  scale_y_discrete(labels = function(x) sub("^.*___", "", x)) +
+  scale_x_continuous(labels = label_number(accuracy = 1)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    x = "Total Hours Listened",
+    y = NULL,
+    title = "Top 10 Artists Before and After 2023",
+    subtitle = "Total streaming hours per artist, ranked within each period"
+  ) +
+  theme_bw()
+```
+
+
+```{r}
+
+compare_artists <- spotify %>%
+  mutate(
+    period = if_else(
+      year > 2022,
+      "2023 and onward",
+      "2022 and before"
+    )
+  ) %>%
+  group_by(period, artist_name) %>%
+  summarise(
+    total_hours = sum(minutes_played) / 60,
+    .groups = "drop"
+  ) 
+top_10_list <- compare_artists %>%
+  group_by(artist_name) %>%
+  summarise(max_hours = max(total_hours)) %>%
+  arrange(desc(max_hours)) %>%
+  slice_head(n = 10) %>%
+  pull(artist_name)
+
+plot_data <- compare_artists %>%
+  filter(artist_name %in% top_10_list) %>%
+  complete(artist_name, period, fill = list(total_hours = 0)) %>%
+  group_by(artist_name) %>%
+  mutate(total_across_both = sum(total_hours)) %>%
+  ungroup() %>%
+  mutate(artist_name = fct_reorder(artist_name, total_across_both))
+
+ggplot(plot_data, aes(x = total_hours, y = artist_name, fill = period)) +
+  geom_col(position = "dodge", width = 0.7) +
+   scale_fill_brewer(
+    palette = "Set2", 
+    name = "Time Period"
+  ) +
+  
+  scale_x_continuous(labels = label_number(accuracy = 1)) +
+  
+  labs(
+    x = "Total Hours Listened", 
+    y = NULL,
+    title = "Top 10 Artists: 2023 and onward vs. 2022 and before",
+    subtitle = "Comparing total streaming hours across two eras"
+  ) +
+  
+  theme_bw()
+```
+
+These two figures show splits of my most listen artists from 2023 and onward and 2022 and before. I chose this split as my freshman year roommate and I challenged each other in 2023 to start to listen to a more diverse portfolio of artists starting then and so I hypothesized my listening habits would change around this period. Here I was able to verify the information about some of the artists from my previous hypotheses. Koji Kondo is almost exclusively listened to prior to 2022 and Kanye sees a great dip in hours listened between the two groups. I chose two separate bar charts in the first figure to display the change in listening habits and artists between eras. The labels and axes make it clear which time period each is referring to. I then did a bar chart with 2023 and onward and 2022 and before plotted next to each other for a better look at the comparison of my overall top 10. This is where I can really see the changes in the listening habits of my top artists. I chose set2 of the color brewer palette as I think it looks nice and is easy to look at. Some of the other other sets I explored I believe had some pre-existing connotations associated that would not make as much sense for my data as well as being harsh on the eyes. 
+
+```{r}
+top_tracks <- spotify %>%
+  group_by(track_name, artist_name) %>%
+  summarise(
+    total_hours = sum(minutes_played) / 60,
+    plays = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_hours)) %>%
+  slice_head(n = 10) %>%
+  mutate(label = paste0(track_name, " — ", artist_name),
+         label = fct_reorder(label, total_hours))
+
+ggplot(top_tracks, aes(x = total_hours, y = label)) +
+  geom_col(fill = brewer.pal(3, "Blues")[3], width = 0.7) +
+  scale_x_continuous(labels = label_number(accuracy = 1)) +
+  labs(
+    x = "Total Hours Listened", 
+    y = NULL,
+    title = "Top 10 Most Listened to Tracks",
+    subtitle = "Based on total streaming hours"
+  ) +
+  theme_bw()
+```
+
+I mainly created this graph to display that the Koji Kondo listening time came from the same song and to verify my previous statement that I would play this song "Super Mario Galaxy: Gusty Garden Galaxy" on repeat while I napped. The justification of the styling is the same as previous graphs.
+
+This was an exploration into the data that I currently have. I think there is a lot of valuable data here that I can explore even deeper into for this project. In the future, I would like to create more interesting and better plots displaying this data. I may be able to create heat maps based on locations I was in during each time period and it could reveal some more insight into the trends. This could create some cool visualizations and I could make somewhat of a lifetime Spotify Wrapped for myself. I would also like to get into the details of smaller chunks of my listening habits for statistical analysis. I want to quantify these differences rather than just looking at the graphs. Another cool option I could do as well if I have time is a comparison against a freind who is similarly aged and see if the data is aligned with trends that I see in my own data. Let me know if this last point is something I should explore further into. 
