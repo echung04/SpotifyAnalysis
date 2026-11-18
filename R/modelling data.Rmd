@@ -1,0 +1,306 @@
+---
+title: "SPE 487 Problem Set #3: A Model-Based Look at My Spotify Listening"
+author: "Evan Chung"
+date: "11/18/2026"
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 6.5, fig.height = 4, fig.align = "center")
+
+library(jsonlite)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(fixest)
+library(patchwork)
+library(lmtest)
+library(RColorBrewer)
+
+files <- list.files(pattern = "\\.json$", full.names = TRUE)
+cat("Found", length(files), "JSON files\n")
+
+read_one <- function(f) {
+  df <- fromJSON(f, flatten = TRUE)
+  df$source_file <- basename(f)
+  df
+}
+
+spotify_raw <- bind_rows(lapply(files, read_one))
+
+cat("Total rows:", nrow(spotify_raw), "\n")
+
+theme_set(theme_minimal(base_size = 11) +
+            theme(panel.grid.minor = element_blank(),
+                  plot.title.position = "plot"))
+```
+
+# 1. Research question
+
+My first-pass question "Do my genres and listening time coincide with significant periods of my life?" was too broad. I changed it in three ways:
+
+1. **One pre-specified break.** I fix a single life transition before looking at the model: September 2022. This coincides with my transition into college and I was interested to see if my listen trends have changed.
+2. **A single outcome at a single unit of analysis.** The unit is the calendar month, and the outcome is **total hours listened that month**. Every covariate is also measured per month, so everything aggregates cleanly to the same level as the listening data.
+3. **A testable claim.** Did my monthly listening time shift in level, or change in trend, after September 2022, once I account for the long-run trend I was already on and for summer seasonality?
+
+
+# 2. Data: one row per month
+
+The raw JSON files from Spotify record every play down to the millisecond, which is too fine-grained to read or model directly. I convert timestamps to local time, convert milliseconds to minutes, keep music only (no podcasts or audiobooks), drop duplicate plays, and keep only the columns I need.
+
+```{r clean}
+spotify <- spotify_raw %>%
+  mutate(
+    ts = as.POSIXct(ts, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    month = as.integer(format(ts, "%m", tz = "America/Indianapolis")),
+    year  = as.integer(format(ts, "%Y", tz = "America/Indianapolis")),
+    minutes_played = ms_played / 1000 / 60
+  ) %>%
+  filter(!is.na(master_metadata_track_name)) %>%
+  distinct(ts, spotify_track_uri, ms_played, .keep_all = TRUE) %>%
+  transmute(
+    track_name  = master_metadata_track_name,
+    artist_name = master_metadata_album_artist_name,
+    album_name  = master_metadata_album_album_name,
+    reason_start,
+    reason_end,
+    month,
+    year,
+    shuffle,
+    skipped,
+    minutes_played
+  )
+```
+
+Next I aggregate to one row per month (the unit of analysis) and build the model variables.
+
+```{r data}
+break_date <- as.Date("2022-09-01") # <-- the pre-specified life transition
+
+monthly <- spotify %>%
+  mutate(date = as.Date(sprintf("%04d-%02d-01", year, month))) %>%
+  group_by(date) %>%
+  summarise(
+    hours_listened = round(sum(minutes_played) / 60, 2),
+    n_plays        = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    year  = as.integer(format(date, "%Y")),
+    month = as.integer(format(date, "%m"))
+  )
+
+# one row per calendar month
+monthly_ts <- monthly %>%
+  transmute(month = date, hours = hours_listened) %>%
+  complete(month = seq(min(month), max(month), by = "month"),
+           fill = list(hours = 0)) %>%
+  mutate(
+    cal_month = as.integer(format(month, "%m")),
+    # months elapsed since the first month in the data
+    t        = as.integer(format(month, "%Y")) * 12 + cal_month,
+    t        = t - min(t),
+    t_break  = t[month == break_date],
+    post     = as.integer(month >= break_date),
+    t_post   = post * (t - t_break),          # extra slope after the break
+    summer   = as.integer(cal_month %in% 6:8)
+  )
+
+n_zero <- sum(monthly_ts$hours == 0)
+```
+
+The data cover `r nrow(monthly_ts)` months. `r n_zero` of them have zero listening. 
+
+```{r estimation-sample}
+model_data <- monthly_ts %>% filter(hours > 0)
+```
+
+# 3. The model
+
+Let $y_t$ be hours listened in month $t$ ($t = 0, 1, 2, \dots$ months since my first month of data), $\text{Post}_t = 1$ if $t$ is September 2022 or later, and $t_0$ the break month. The model is
+
+$$
+\ y_t = \beta_0 + \beta_1\, t + \beta_2\, \text{Post}_t + \beta_3\, \text{Post}_t \cdot (t - t_0) + \beta_4\, \text{Summer}_t + \varepsilon_t .
+$$
+
+In words:
+
+- $\beta_1$: the pre-break monthly trend in hours.
+- $\beta_2$: the shift at the break of September 2022, net of the trend.
+- $\beta_3$: the change in trend after the break.
+- $\beta_4$: the summer (June to August) effect, a seasonal control.
+
+**Estimation method:** ordinary least squares (OLS), which is also the maximum likelihood estimator under normal errors.
+
+```{r fit}
+fit <- feols(hours ~ t + post + t_post + summer,
+             data = model_data, vcov = "iid")
+```
+
+# 4. Is this model appropriate? (EDA checks)
+
+## 4.1 The outcome: raw or logged?
+
+```{r}
+p_raw <- ggplot(model_data, aes(hours)) +
+  geom_histogram(bins = 20, colour = "white") +
+  labs(x = "Hours listened per month", y = "Number of months", title = "Raw hours")
+
+p_log <- ggplot(model_data, aes(hours)) +
+  geom_histogram(bins = 20, colour = "white") +
+  scale_x_log10(labels = label_number(accuracy = 1)) +
+  labs(x = "Hours listened per month (log scale)", y = NULL, title = "Log-scaled hours")
+
+gridExtra::grid.arrange(p_raw, p_log, ncol = 2)
+```
+
+**Design choices.** Histograms are the right graph for a single distribution, since position along a common baseline is the most accurate perceptual encoding and bar heights are directly comparable. I put the two panels side by side with the same bar color logic and the same y-axis meaning, so the only thing that differs is the transformation. I decided that the log scale was inappropriate here based on the graph because the raw hours are roughly bell shaped. 
+
+## 4.2 Is the time trend roughly linear, and is there a visible break?
+
+```{r}
+
+set2  <- brewer.pal(8, "Set2")
+dark2 <- brewer.pal(8, "Dark2")
+
+quarterly <- monthly %>%
+  mutate(
+    quarter_num = quarter(date),
+    quarter_label = paste0(year, " Q", quarter_num),
+    quarter_date = as.Date(paste0(year, "-", (quarter_num - 1) * 3 + 1, "-01"))
+  ) %>%
+  group_by(quarter_date, quarter_label) %>%
+  summarise(
+    hours_listened = sum(hours_listened),
+    .groups = "drop"
+  )
+
+fig1_quarterly <- ggplot(quarterly, aes(quarter_date, hours_listened)) +
+  geom_vline(xintercept = break_date, linetype = "dashed", color = "grey30") +
+  geom_line(color = "grey") +
+  geom_point(color = "black", size = 2.5) +
+  geom_smooth(method = "loess", se = FALSE, color = dark2[2], linewidth = 0.8) +
+  scale_x_date(
+    date_breaks = "1 year", 
+    date_labels = "%Y"
+  ) +
+  scale_y_continuous(labels = label_number(accuracy = 1)) +
+  
+  labs(
+    x = "Year", y = "Total Hours Listened (per Quarter)",
+    title = "Quarterly Listening Volume",
+    subtitle = "Aggregated in 3-month blocks"
+  ) +
+  
+  theme_bw(base_size = 12) 
+
+fig1_quarterly
+```
+
+**Design choices.** This plot splits the listening data into quarters for each year. This way I still maintain the trends over smaller time periods without the graph looking too messy when trying to determine trends. I introduced labels that make sense for someone looking at the graph for the first time as well as making it clear what trends existed. The plotted points made it easier to determine exactly when some of the quarters are happening as well, adding clarity.
+
+## 4.3 Residual diagnostics, including autocorrelation
+
+Because these are monthly data, a month's error may be related to the previous month's error. If so, the coefficients are still reasonable but the standard errors are too small. I check this with formal tests.
+
+```{r autocorr-tests}
+#I used AI here to help with autocorrelation tests as I forgot what methods to use.
+fit_lm <- lm(hours ~ t + post + t_post + summer, data = model_data)
+
+dw <- dwtest(fit_lm)
+bg <- bgtest(fit_lm, order = 3)
+tibble(
+  Test = c("Durbin-Watson (lag 1)", "Breusch-Godfrey (up to lag 3)"),
+  Statistic = round(c(unname(dw$statistic), unname(bg$statistic)), 3),
+  `p-value` = round(c(dw$p.value, bg$p.value), 3)
+) %>% knitr::kable(caption = "Tests for autocorrelation in the residuals. Null hypothesis: no autocorrelation.")
+
+set.seed(487)
+car::durbinWatsonTest(fit_lm, max.lag = 3)
+```
+
+Because my data are a monthly time series, I tested whether the model’s residuals are correlated from one month to the next. They are. The lag-1 residual autocorrelation is about 0.42, and the Durbin-Watson statistic is 1.05 (p < 0.001), well below the value of 2 expected under no autocorrelation. Correlation at lags 2 and 3 is much weaker and only borderline significant (p = 0.060 and 0.078), so the dependence is concentrated in adjacent months. In practice, when I listened more than the model predicted in one month, I tended to listen more than predicted the next month as well.
+
+This is important for how I read the results. The coefficient estimates are still reasonable, but ordinary least squares assumes each month’s error is independent. With positive autocorrelation, each month tells me less than a fully independent observation would, so the reported standard errors are too small. My confidence intervals are therefore narrower, and my p-values smaller, than they should be. I treat results that are only borderline significant with caution, and I place more weight on effects that are large relative to their uncertainty.
+
+# 5. Estimates
+
+```{r table}
+ct <- as.data.frame(coeftable(fit))
+ci_tab <- confint(fit)
+
+term_labels <- c("(Intercept)" = "Intercept",
+                 "t"           = "Time trend (per month, before break)",
+                 "post"        = "Level shift at break",
+                 "t_post"      = "Change in trend after break",
+                 "summer"      = "Summer (Jun to Aug)")
+
+reg_table <- tibble(
+  Term       = unname(term_labels[rownames(ct)]),
+  Estimate   = round(ct$Estimate, 3),
+  `Std. Error` = round(ct$`Std. Error`, 3),
+  `p-value`  = round(ct$`Pr(>|t|)`, 3),
+  `95% CI`   = sprintf("[%.3f, %.3f]", ci_tab[, 1], ci_tab[, 2])
+)
+
+knitr::kable(reg_table,
+  caption = "OLS estimates from feols (outcome: monthly hours). Standard errors are conventional (iid).")
+```
+
+The model fits `r nobs(fit)` months with $R^2 =$ `r round(fixest::r2(fit, "r2"), 2)`.
+
+# 6. Quantities of interest
+
+## 6.1 Predicted listening over time, with and without the break
+
+I use `predict()` with 95% confidence intervals and hold `summer = 0`, so the line shows a typical non-summer month. The dashed line is where listening would have gone had the pre-break trend simply continued.
+
+```{r}
+grid <- monthly_ts %>%
+  mutate(summer = 0) %>%
+  select(month, t, post, t_post, summer)
+
+b <- coef(fit)
+V <- vcov(fit)
+crit <- qt(0.975, nobs(fit) - length(b))
+
+X    <- cbind(1, grid$t, grid$post, grid$t_post, grid$summer)
+X_cf <- cbind(1, grid$t, 0, 0, grid$summer)
+
+fit_hat <- as.numeric(X %*% b)
+se_hat  <- sqrt(rowSums((X %*% V) * X))
+
+grid <- grid %>%
+  mutate(hours_hat = fit_hat,
+         lwr = fit_hat - crit * se_hat,
+         upr = fit_hat + crit * se_hat,
+         cf_hat = as.numeric(X_cf %*% b))
+
+ggplot(grid, aes(month)) +
+  geom_vline(xintercept = break_date, linetype = "dashed", color = "grey") +
+  geom_point(data = model_data %>% filter(summer == 0), aes(y = hours),
+             color = set2[8], size = 1.8) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), fill = set2[1], alpha = 0.3) +
+  geom_line(aes(y = hours_hat), color = dark2[1], linewidth = 1) +
+  geom_line(data = grid %>% filter(month >= break_date),
+            aes(y = cf_hat), color = dark2[2], linetype = "dashed", linewidth = 1) +
+  labs(x = NULL, y = "Predicted hours per month",
+       title = "Did listening change after September 2022?")
+```
+
+**Design choices.** A line with a shaded ribbon is the standard way to show a prediction and its uncertainty over a continuous predictor. The ribbon is a light tint of the line color, so the uncertainty reads as part of the estimate but cannot be mistaken for data. The two lines differ by color and line type (solid versus dashed), so the contrast survives grayscale printing and colorblind viewing. Observed points are grey and in the background, so they give context without drawing the eye away from the model. 
+
+Before September 2022, my monthly listening rose steadily, from under 10 hours in 2018 to over 70 hours. After the transition, listening dropped by roughly 20 hours and then continued to grow much more slowly. By 2026 the model estimates I listen about 50 fewer hours per month than the earlier trend would have implied, though the confidence bands are likely too narrow given the autocorrelation in the residuals. I also need to consider the fact that listening time does not grow in a linear path for all of time and will eventually peak off.
+
+
+
+# 7. Interpretation
+
+My question was whether my monthly listening time shifted in level or trend after September 2022, when I started college, once I account for the trend I was already on and for summer seasonality. The model suggests that it did. Before the transition, my listening grew by about 1.19 hours per month, every month (95% CI: 0.82 to 1.57), which is roughly 14 additional hours per month each year. At September 2022 the model shows a drop in the level of listening of about 20 hours per month (95% CI: -37.4 to -3.4, p = 0.019). The growth rate also slowed by about 0.65 hours per month (95% CI: -1.22 to -0.07, p = 0.027), so after the break I gain only about 0.55 hours per month, or roughly 7 hours per month each year. Because the level drop and the slower growth add up over time, the model estimates that by late 2026 I listen about 50 fewer hours per month than the pre-2022 trend would have implied. Summer months are not distinguishable from the rest of the year (0.2 hours, 95% CI: -9.6 to 10.0, p = 0.97), so seasonality does not appear to drive these results.
+
+I do not read these estimates as precise, for several reasons. First, my residuals are strongly autocorrelated (lag-1 autocorrelation of about 0.42, Durbin-Watson statistic of 1.05, p < 0.001), so each month carries less independent information than the standard errors assume. The standard errors above are therefore too small. The break effects, with p-values of 0.019 and 0.027, are only moderately strong, and correcting for autocorrelation could plausibly push them above conventional significance thresholds. I treat them as suggestive, not conclusive. Second, a straight pre-break trend is a strong assumption. My early data, when I was just starting to use Spotify heavily, push the line steeply upward, so the fitted line overshoots the plateau I see in 2021 and 2022, which likely exaggerates both the size of the drop and the gap. Third, my final month in the data is probably incomplete and sits well below the rest.
+
+Finally, this is a single time series with one pre-specified break, so it shows that my listening changed around the time of the transition, not that the transition caused the change. Other things that changed in my life at the same time, such as a new schedule, new listening contexts, or different devices, are mixed into the same estimate. I also found other trends in the data that may be worth exploring. Next steps would be to model the autocorrelation directly, allow a curved pre-break trend, and test whether the break effect still appears when the last partial month is removed.
